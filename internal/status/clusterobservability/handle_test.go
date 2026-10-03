@@ -19,6 +19,7 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1"
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1beta1"
+	"github.com/open-telemetry/opentelemetry-operator/internal/manifests/clusterobservability"
 )
 
 func TestUpdateClusterObservabilityStatusReady(t *testing.T) {
@@ -70,7 +71,7 @@ func TestUpdateClusterObservabilityStatusReady(t *testing.T) {
 		},
 	)
 
-	updateClusterObservabilityStatus(context.Background(), logr.Discard(), cli, co, false)
+	updateClusterObservabilityStatus(context.Background(), logr.Discard(), cli, co, false, nil)
 
 	assert.Equal(t, "Ready", co.Status.Phase)
 	assert.Equal(t, co.Generation, co.Status.ObservedGeneration)
@@ -78,10 +79,94 @@ func TestUpdateClusterObservabilityStatusReady(t *testing.T) {
 		assert.Truef(t, co.Status.ComponentsStatus[component].Ready, "component %q should be ready", component)
 	}
 
+	assert.Nil(t, findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionExporterTLSReady),
+		"condition must be absent when the exporter references no TLS material")
+
 	ready := findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionReady)
 	require.NotNil(t, ready)
 	assert.Equal(t, metav1.ConditionTrue, ready.Status)
 	assert.Equal(t, reasonReady, ready.Reason)
+}
+
+func TestUpdateClusterObservabilityStatusExporterTLSBlocked(t *testing.T) {
+	const (
+		name      = "cluster-obs"
+		namespace = "observability"
+	)
+	co := &v1alpha1.ClusterObservability{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Generation: 2},
+		Spec: v1alpha1.ClusterObservabilitySpec{
+			Exporter: v1alpha1.OTLPHTTPExporter{
+				Endpoint: "https://backend.example.com:4318",
+				TLS: &v1alpha1.TLSConfig{
+					CA: &v1alpha1.TLSReference{Secret: &v1alpha1.TLSKeySelector{Name: "missing-ca"}},
+				},
+			},
+		},
+	}
+	cli := newStatusTestClient(t)
+
+	blocked := &clusterobservability.ExporterTLSReferenceError{
+		Reason:  clusterobservability.ReasonExporterTLSReferenceMissing,
+		Message: "exporter tls: Secret \"missing-ca\" referenced by CA not found",
+	}
+	updateClusterObservabilityStatus(context.Background(), logr.Discard(), cli, co, false, blocked)
+
+	assert.Equal(t, "Pending", co.Status.Phase)
+	assert.Equal(t, blocked.Message, co.Status.Message)
+	assert.Equal(t, co.Generation, co.Status.ObservedGeneration)
+
+	condition := findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionExporterTLSReady)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, blocked.Reason, condition.Reason)
+	assert.Equal(t, blocked.Message, condition.Message)
+
+	ready := findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionReady)
+	if ready != nil {
+		assert.Equal(t, metav1.ConditionFalse, ready.Status)
+	}
+}
+
+func TestUpdateClusterObservabilityStatusExporterTLSResolved(t *testing.T) {
+	const (
+		name      = "cluster-obs"
+		namespace = "observability"
+	)
+	co := &v1alpha1.ClusterObservability{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: v1alpha1.ClusterObservabilitySpec{
+			Exporter: v1alpha1.OTLPHTTPExporter{
+				Endpoint: "https://backend.example.com:4318",
+				TLS: &v1alpha1.TLSConfig{
+					CA: &v1alpha1.TLSReference{ConfigMap: &v1alpha1.TLSKeySelector{Name: "ca-bundle"}},
+				},
+			},
+		},
+	}
+	cli := newStatusTestClient(t)
+
+	updateClusterObservabilityStatus(context.Background(), logr.Discard(), cli, co, false, nil)
+
+	condition := findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionExporterTLSReady)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionTrue, condition.Status)
+	assert.Equal(t, reasonExporterTLS, condition.Reason)
+}
+
+func TestSetAndRemoveExporterTLSReadyCondition(t *testing.T) {
+	conditions := setExporterTLSReadyCondition(nil,
+		metav1.ConditionFalse, "Reason", "message", metav1.Now())
+	require.Len(t, conditions, 1)
+
+	conditions = setExporterTLSReadyCondition(conditions,
+		metav1.ConditionTrue, "OtherReason", "other message", metav1.Now())
+	require.Len(t, conditions, 1)
+	assert.Equal(t, metav1.ConditionTrue, conditions[0].Status)
+	assert.Equal(t, "OtherReason", conditions[0].Reason)
+
+	conditions = removeExporterTLSReadyCondition(conditions)
+	assert.Empty(t, conditions)
 }
 
 func TestCheckClusterCollectorStatusRequiresReadyStatefulSet(t *testing.T) {

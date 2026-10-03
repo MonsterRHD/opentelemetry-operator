@@ -172,7 +172,55 @@ spec:
     timeout: "30s"
 ```
 
-**Note**: TLS certificate file mounting (`ca_file`, `cert_file`, `key_file`) is not supported yet even though the config can be set.
+**Note**: The exporter supports custom CA certificates and mutual TLS through
+Secret or ConfigMap references (see below). The `ca_file`, `cert_file` and
+`key_file` settings name paths inside the collector container; referencing the
+material directly is the supported way to provide these files.
+
+### Exporter TLS references
+
+When the exporter endpoint requires a custom CA or mutual TLS, reference the
+CA, client certificate and private key from a Secret or a ConfigMap in the same
+namespace as the ClusterObservability. The operator mounts the referenced keys
+at identical paths in both the agent and the cluster collectors and sets the
+corresponding `ca_file`, `cert_file` and `key_file` exporter settings. When a
+`key` is omitted it defaults to `ca.crt` for the CA, `tls.crt` for the client
+certificate and `tls.key` for the private key.
+
+```yaml
+spec:
+  exporter:
+    endpoint: "https://otel.example.com:4318"
+    tls:
+      server_name: "otel.example.com"
+      ca:
+        configMap:
+          name: otel-ca
+          # key: ca.crt
+      client_certificate:
+        secret:
+          name: otel-client-tls
+          # key: tls.crt
+      client_key:
+        secret:
+          name: otel-client-tls
+          # key: tls.key
+```
+
+The CA may come from either a Secret or a ConfigMap, and the client
+certificate/key may come from either as well. `client_certificate` and
+`client_key` must be provided together for mutual TLS; the CA alone is enough
+for server verification with a custom CA. Each reference must set exactly one
+of `secret` or `configMap`.
+
+The agent and cluster collectors are updated only when every referenced
+resource exists, holds the selected key and the certificate/key pair is
+complete. While any reference is missing or incomplete the operator keeps the
+previous working collector configuration and reports a recoverable reason in
+the `ExporterTLSReady` status condition (with an event); once the references
+resolve, the condition becomes `True` and the collectors converge. Exporters
+that use the system trust store, set `insecure: true`, or configure no TLS, as
+well as the generated Instrumentation endpoint, keep their previous behavior.
 
 
 ## Conflict Detection Example

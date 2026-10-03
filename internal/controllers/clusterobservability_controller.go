@@ -84,6 +84,7 @@ func NewClusterObservabilityReconciler(params ClusterObservabilityReconcilerPara
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 //+kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=get;list;watch;create;update;patch;delete
@@ -145,7 +146,21 @@ func (r *ClusterObservabilityReconciler) Reconcile(ctx context.Context, req ctrl
 
 	params := r.getParams(instance)
 
-	desiredObjects, buildErr := clusterobservability.Build(params)
+	// Resolve the Secret/ConfigMap material referenced by the exporter TLS
+	// configuration. Recoverable reference errors keep the previous collector
+	// configuration in place and are surfaced on the resource status; other
+	// errors (for example API access failures) retry the reconciliation.
+	exporterTLS, tlsResolveErr := clusterobservability.ResolveExporterTLS(ctx, params)
+	var tlsBlocked *clusterobservability.ExporterTLSReferenceError
+	if tlsResolveErr != nil {
+		if !errors.As(tlsResolveErr, &tlsBlocked) {
+			return ctrl.Result{}, tlsResolveErr
+		}
+		log.Info("Exporter TLS references are not ready; keeping previous collector configuration",
+			"reason", tlsBlocked.Reason, "message", tlsBlocked.Message)
+	}
+
+	desiredObjects, buildErr := clusterobservability.Build(params, exporterTLS)
 	if buildErr != nil {
 		return ctrl.Result{}, buildErr
 	}
@@ -165,8 +180,17 @@ func (r *ClusterObservabilityReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
-	// Handle OpenTelemetry CRs - their controllers manage the underlying resources
+	// Handle OpenTelemetry CRs - their controllers manage the underlying resources.
+	// While exporter TLS references are unresolved, leave both collectors on their
+	// previous configuration but keep reconciling the Instrumentation CR.
 	for _, crObj := range openTelemetryCRs {
+		if tlsBlocked != nil {
+			if _, skip := crObj.(*v1beta1.OpenTelemetryCollector); skip {
+				log.Info("Skipping OpenTelemetryCollector update while exporter TLS references are unresolved",
+					"name", crObj.GetName(), "namespace", crObj.GetNamespace())
+				continue
+			}
+		}
 		if err := r.reconcileOpenTelemetryResource(ctx, log, crObj); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile OpenTelemetry CR %s: %w", crObj.GetObjectKind(), err)
 		}
@@ -189,7 +213,11 @@ func (r *ClusterObservabilityReconciler) Reconcile(ctx context.Context, req ctrl
 			return ctrl.Result{}, err
 		}
 	}
-	return coStatus.HandleReconcileStatus(ctx, log, params, nil)
+	var reconcileErr error
+	if tlsBlocked != nil {
+		reconcileErr = tlsBlocked
+	}
+	return coStatus.HandleReconcileStatus(ctx, log, params, reconcileErr)
 }
 
 // reconcileOpenTelemetryResource creates/updates OpenTelemetry CRs.
@@ -337,6 +365,17 @@ func (r *ClusterObservabilityReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		Watches(
 			&corev1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.findClusterObservabilityForNamespace),
+		).
+		// A referenced Secret or ConfigMap may be created or completed after the
+		// ClusterObservability, so requeue referencing resources to converge once
+		// the TLS material becomes available.
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findClusterObservabilityForTLSReference),
+		).
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.findClusterObservabilityForTLSReference),
 		)
 
 	for _, resource := range ownedResources {
@@ -384,6 +423,28 @@ func (r *ClusterObservabilityReconciler) findClusterObservabilityForNamespace(co
 		requests = append(requests, ctrl.Request{
 			NamespacedName: client.ObjectKeyFromObject(&co),
 		})
+	}
+	return requests
+}
+
+// findClusterObservabilityForTLSReference enqueues ClusterObservability resources
+// whose exporter TLS configuration references the changed Secret or ConfigMap,
+// so a missing or incomplete reference converges once it is fixed.
+func (r *ClusterObservabilityReconciler) findClusterObservabilityForTLSReference(ctx context.Context, obj client.Object) []ctrl.Request {
+	var clusterObservabilityList v1alpha1.ClusterObservabilityList
+	if err := r.List(ctx, &clusterObservabilityList); err != nil {
+		r.log.Error(err, "failed to list ClusterObservability resources")
+		return nil
+	}
+
+	var requests []ctrl.Request
+	for i := range clusterObservabilityList.Items {
+		co := &clusterObservabilityList.Items[i]
+		if clusterobservability.TLSReferenceMatches(co, obj) {
+			requests = append(requests, ctrl.Request{
+				NamespacedName: client.ObjectKeyFromObject(co),
+			})
+		}
 	}
 	return requests
 }

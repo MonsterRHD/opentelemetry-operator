@@ -93,12 +93,60 @@ type TLSConfig struct {
 	KeyFile string `json:"key_file,omitempty"`
 
 	// Insecure controls whether to use insecure transport. Default is false.
+	// It must not be combined with CA, ClientCertificate or ClientKey references.
 	// +optional
 	Insecure bool `json:"insecure,omitempty"`
 
 	// ServerName for TLS handshake. If empty, uses the hostname from endpoint.
 	// +optional
 	ServerName string `json:"server_name,omitempty"`
+
+	// CA references the CA certificate used to verify the exporter endpoint.
+	// The referenced key is mounted into both managed collectors and ca_file is
+	// set to the mount path. Exactly one of secret or configMap must be set.
+	// +optional
+	CA *TLSReference `json:"ca,omitempty"`
+
+	// ClientCertificate references the client certificate used for mutual TLS.
+	// It must be set together with ClientKey; setting only one of them is invalid.
+	// Exactly one of secret or configMap must be set.
+	// +optional
+	ClientCertificate *TLSReference `json:"client_certificate,omitempty"`
+
+	// ClientKey references the private key matching ClientCertificate.
+	// It must be set together with ClientCertificate; setting only one of them
+	// is invalid. Exactly one of secret or configMap must be set.
+	// +optional
+	ClientKey *TLSReference `json:"client_key,omitempty"`
+}
+
+// TLSReference selects TLS material (CA certificate, client certificate or
+// private key) from a Secret or a ConfigMap in the same namespace as the
+// ClusterObservability. Exactly one of secret or configMap must be set.
+type TLSReference struct {
+	// Secret sources the material from a key of a Secret in the same namespace
+	// as the ClusterObservability.
+	// +optional
+	Secret *TLSKeySelector `json:"secret,omitempty"`
+
+	// ConfigMap sources the material from a key of a ConfigMap in the same
+	// namespace as the ClusterObservability.
+	// +optional
+	ConfigMap *TLSKeySelector `json:"configMap,omitempty"`
+}
+
+// TLSKeySelector selects a key within a Secret or ConfigMap.
+type TLSKeySelector struct {
+	// Name of the Secret or ConfigMap, in the same namespace as the ClusterObservability.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Key within the resource data. When omitted, a role-specific default is
+	// applied: ca.crt for CA, tls.crt for the client certificate and tls.key
+	// for the private key.
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // SendingQueueConfig defines configuration for the sending queue.
@@ -164,6 +212,10 @@ const (
 	ClusterObservabilityConditionConfigured ClusterObservabilityConditionType = "Configured"
 	// ClusterObservabilityConditionConflicted indicates that multiple ClusterObservability resources exist.
 	ClusterObservabilityConditionConflicted ClusterObservabilityConditionType = "Conflicted"
+	// ClusterObservabilityConditionExporterTLSReady indicates whether the Secret or ConfigMap
+	// references used by the OTLP HTTP exporter TLS configuration resolve to complete,
+	// readable material. The condition is absent when the exporter references no TLS material.
+	ClusterObservabilityConditionExporterTLSReady ClusterObservabilityConditionType = "ExporterTLSReady"
 )
 
 const (

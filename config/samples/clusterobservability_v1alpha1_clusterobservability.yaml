@@ -29,11 +29,20 @@ spec:
     # Optional: Request timeout
     timeout: "30s"
     
-    # Optional: TLS configuration
-    # Note: File mounting for ca_file, cert_file, key_file is not yet supported
+    # Optional: TLS configuration. Reference CA/client cert/key from a Secret
+    # or ConfigMap in this namespace instead of setting in-container file paths.
     # tls:
-    #   insecure: false
     #   server_name: "otel-backend.example.com"
+    #   ca:
+    #     configMap:
+    #       name: otel-ca
+    #   client_certificate:
+    #     secret:
+    #       name: otel-client-tls
+    #   client_key:
+    #     secret:
+    #       name: otel-client-tls
+    #   # insecure: true must not be combined with the references above
     
     # Optional: Retry configuration
     # retry_on_failure:

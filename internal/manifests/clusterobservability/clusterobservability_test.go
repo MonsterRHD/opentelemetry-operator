@@ -36,12 +36,12 @@ func TestBuildCollectors_UseClusterObservabilityCollectorImage(t *testing.T) {
 		Config: operatorcfg.Config{ClusterObservabilityCollectorImage: img},
 	}
 
-	agent, err := buildAgentCollector(params, config.DistroProvider(""))
+	agent, err := buildAgentCollector(params, config.DistroProvider(""), nil)
 	require.NoError(t, err)
 	assert.Equal(t, img, agent.Spec.Image)
 	assert.Equal(t, "9.9.9", agent.Labels["app.kubernetes.io/version"])
 
-	cluster, err := buildClusterCollector(params)
+	cluster, err := buildClusterCollector(params, nil)
 	require.NoError(t, err)
 	assert.Equal(t, img, cluster.Spec.Image)
 	assert.Equal(t, "9.9.9", cluster.Labels["app.kubernetes.io/version"])

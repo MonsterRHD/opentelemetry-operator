@@ -1,0 +1,13 @@
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. collector, target allocator, auto-instrumentation, opamp, github action)
+component: cluster-observability
+
+# A brief description of the change. Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Allow referencing the OTLP HTTP exporter CA, client certificate and private key from same-namespace Secrets or ConfigMaps; missing or incomplete references keep the previous agent and cluster collector configuration and are reported on the ClusterObservability status.
+
+# One or more tracking issues related to the change
+issues: []
+
+# (Optional) One or more lines of additional information to render under the primary note.
+subtext:

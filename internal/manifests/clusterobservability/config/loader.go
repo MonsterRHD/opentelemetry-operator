@@ -61,6 +61,16 @@ type PipelineConfig struct {
 	Exporters  []string `yaml:"exporters"`
 }
 
+// ExporterTLSFiles holds the in-container paths of the TLS material projected
+// for the OTLP HTTP exporter from referenced Secrets or ConfigMaps. The same
+// paths are used by both managed collectors. An empty field means the
+// corresponding file is not mounted.
+type ExporterTLSFiles struct {
+	CAFile   string
+	CertFile string
+	KeyFile  string
+}
+
 // ConfigLoader loads and merges collector configurations.
 type ConfigLoader struct {
 	fs embed.FS
@@ -74,7 +84,7 @@ func NewConfigLoader() *ConfigLoader {
 }
 
 // LoadCollectorConfig loads and merges collector configuration for the specified type and distro.
-func (c *ConfigLoader) LoadCollectorConfig(collectorType CollectorType, distroProvider DistroProvider, spec v1alpha1.ClusterObservabilitySpec) (v1beta1.Config, error) {
+func (c *ConfigLoader) LoadCollectorConfig(collectorType CollectorType, distroProvider DistroProvider, spec v1alpha1.ClusterObservabilitySpec, exporterTLSFiles *ExporterTLSFiles) (v1beta1.Config, error) {
 	// Load base configuration
 	baseConfig, err := c.loadBaseConfig(collectorType)
 	if err != nil {
@@ -97,7 +107,7 @@ func (c *ConfigLoader) LoadCollectorConfig(collectorType CollectorType, distroPr
 	}
 
 	// Build exporters configuration based on per-signal or default exporter
-	exporters := c.buildExportersConfig(spec)
+	exporters := c.buildExportersConfig(spec, exporterTLSFiles)
 	finalConfig.Exporters = exporters
 
 	// Build pipelines with all signals enabled
@@ -146,7 +156,7 @@ func (c *ConfigLoader) loadDistroOverrides(collectorType CollectorType, distroPr
 }
 
 // buildExportersConfig builds exporters configuration from the single OTLP HTTP exporter spec.
-func (*ConfigLoader) buildExportersConfig(spec v1alpha1.ClusterObservabilitySpec) map[string]any {
+func (*ConfigLoader) buildExportersConfig(spec v1alpha1.ClusterObservabilitySpec, exporterTLSFiles *ExporterTLSFiles) map[string]any {
 	exporters := make(map[string]any)
 
 	// Build the OTLP HTTP exporter configuration.
@@ -169,17 +179,33 @@ func (*ConfigLoader) buildExportersConfig(spec v1alpha1.ClusterObservabilitySpec
 		otlpConfig["profiles_endpoint"] = spec.Exporter.ProfilesEndpoint
 	}
 
-	// TODO: We do not really handle taking the CA/Cert/Key.
+	// Resolved Secret/ConfigMap references take precedence over the plain
+	// ca_file/cert_file/key_file settings: those settings name container paths
+	// and the operator only mounts referenced material onto the paths below.
 	if spec.Exporter.TLS != nil {
 		tlsConfig := map[string]any{}
-		if spec.Exporter.TLS.CAFile != "" {
-			tlsConfig["ca_file"] = spec.Exporter.TLS.CAFile
+		caFile := spec.Exporter.TLS.CAFile
+		certFile := spec.Exporter.TLS.CertFile
+		keyFile := spec.Exporter.TLS.KeyFile
+		if exporterTLSFiles != nil {
+			if exporterTLSFiles.CAFile != "" {
+				caFile = exporterTLSFiles.CAFile
+			}
+			if exporterTLSFiles.CertFile != "" {
+				certFile = exporterTLSFiles.CertFile
+			}
+			if exporterTLSFiles.KeyFile != "" {
+				keyFile = exporterTLSFiles.KeyFile
+			}
 		}
-		if spec.Exporter.TLS.CertFile != "" {
-			tlsConfig["cert_file"] = spec.Exporter.TLS.CertFile
+		if caFile != "" {
+			tlsConfig["ca_file"] = caFile
 		}
-		if spec.Exporter.TLS.KeyFile != "" {
-			tlsConfig["key_file"] = spec.Exporter.TLS.KeyFile
+		if certFile != "" {
+			tlsConfig["cert_file"] = certFile
+		}
+		if keyFile != "" {
+			tlsConfig["key_file"] = keyFile
 		}
 		if spec.Exporter.TLS.Insecure {
 			tlsConfig["insecure"] = spec.Exporter.TLS.Insecure

@@ -96,10 +96,79 @@ spec:
                     type: string
                   tls:
                     properties:
+                      ca:
+                        properties:
+                          configMap:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          secret:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        type: object
                       ca_file:
                         type: string
                       cert_file:
                         type: string
+                      client_certificate:
+                        properties:
+                          configMap:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          secret:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        type: object
+                      client_key:
+                        properties:
+                          configMap:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          secret:
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        type: object
                       insecure:
                         type: boolean
                       key_file:

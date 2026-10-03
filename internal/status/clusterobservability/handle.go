@@ -5,6 +5,7 @@ package clusterobservability
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1"
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1beta1"
 	"github.com/open-telemetry/opentelemetry-operator/internal/manifests"
+	"github.com/open-telemetry/opentelemetry-operator/internal/manifests/clusterobservability"
 	"github.com/open-telemetry/opentelemetry-operator/internal/manifests/clusterobservability/config"
 )
 
@@ -29,6 +31,7 @@ const (
 	reasonInfo          = "Info"
 	reasonReady         = "Ready"
 	reasonConfigured    = "Configured"
+	reasonExporterTLS   = "ExporterTLSReady"
 
 	// Component status keys.
 	componentAgentCollector   = "agent"
@@ -45,13 +48,23 @@ func HandleReconcileStatus(ctx context.Context, log logr.Logger, params manifest
 	// Check if this is a conflict error
 	isConflicted := err != nil && isConflictError(err)
 
-	if err != nil && !isConflicted {
+	// A recoverable exporter TLS reference error does not fail the loop: the
+	// previous collector configuration is kept and Secret/ConfigMap watches
+	// trigger another reconciliation once the material becomes available.
+	var tlsBlocked *clusterobservability.ExporterTLSReferenceError
+	tlsUnresolved := errors.As(err, &tlsBlocked)
+
+	if err != nil && !isConflicted && !tlsUnresolved {
 		params.Recorder.Eventf(&params.ClusterObservability, nil, corev1.EventTypeWarning, reasonError, reasonError, err.Error())
 		return ctrl.Result{}, err
 	}
 
+	if tlsUnresolved {
+		params.Recorder.Eventf(&params.ClusterObservability, nil, corev1.EventTypeWarning, tlsBlocked.Reason, tlsBlocked.Reason, tlsBlocked.Message)
+	}
+
 	// Update component status and overall status
-	updateClusterObservabilityStatus(ctx, log, params.Client, changed, isConflicted)
+	updateClusterObservabilityStatus(ctx, log, params.Client, changed, isConflicted, tlsBlocked)
 
 	statusPatch := client.MergeFrom(&params.ClusterObservability)
 	if err := params.Client.Status().Patch(ctx, changed, statusPatch); err != nil {
@@ -73,7 +86,7 @@ func isConflictError(err error) bool {
 }
 
 // updateClusterObservabilityStatus updates the status of ClusterObservability based on component health.
-func updateClusterObservabilityStatus(ctx context.Context, log logr.Logger, cli client.Client, co *v1alpha1.ClusterObservability, isConflicted bool) {
+func updateClusterObservabilityStatus(ctx context.Context, log logr.Logger, cli client.Client, co *v1alpha1.ClusterObservability, isConflicted bool, tlsBlocked *clusterobservability.ExporterTLSReferenceError) {
 	// Initialize ComponentsStatus if nil
 	if co.Status.ComponentsStatus == nil {
 		co.Status.ComponentsStatus = make(map[string]v1alpha1.ComponentStatus)
@@ -150,6 +163,13 @@ func updateClusterObservabilityStatus(ctx context.Context, log logr.Logger, cli 
 	// Update overall status based on component status
 	allReady := agentCollectorStatus.ready && clusterCollectorStatus.ready && instrumentationStatus.ready
 
+	// While exporter TLS references are unresolved the desired configuration
+	// is not applied, so the resource cannot be considered fully ready even
+	// though the previous collector configuration is still running.
+	if tlsBlocked != nil {
+		allReady = false
+	}
+
 	// Update conditions
 	configuredCondition := findCondition(co.Status.Conditions, v1alpha1.ClusterObservabilityConditionConfigured)
 	if configuredCondition == nil {
@@ -194,6 +214,22 @@ func updateClusterObservabilityStatus(ctx context.Context, log logr.Logger, cli 
 	} else {
 		co.Status.Phase = "Pending"
 		co.Status.Message = "Some components are not ready"
+	}
+
+	// Surface the exporter TLS reference state. The condition only exists when
+	// the exporter references TLS material; while a reference is missing or
+	// incomplete the phase stays Pending and the recoverable reason is exposed.
+	switch {
+	case tlsBlocked != nil:
+		co.Status.Phase = "Pending"
+		co.Status.Message = tlsBlocked.Message
+		co.Status.Conditions = setExporterTLSReadyCondition(co.Status.Conditions,
+			metav1.ConditionFalse, tlsBlocked.Reason, tlsBlocked.Message, now)
+	case clusterobservability.HasExporterTLSReferences(co.Spec):
+		co.Status.Conditions = setExporterTLSReadyCondition(co.Status.Conditions,
+			metav1.ConditionTrue, reasonExporterTLS, "Exporter TLS references resolved and applied", now)
+	default:
+		co.Status.Conditions = removeExporterTLSReadyCondition(co.Status.Conditions)
 	}
 
 	// Update config versions to track changes
@@ -469,4 +505,37 @@ func findCondition(conditions []v1alpha1.ClusterObservabilityCondition, condType
 		}
 	}
 	return nil
+}
+
+// setExporterTLSReadyCondition adds or updates the ExporterTLSReady condition.
+func setExporterTLSReadyCondition(conditions []v1alpha1.ClusterObservabilityCondition, status metav1.ConditionStatus, reason, message string, now metav1.Time) []v1alpha1.ClusterObservabilityCondition {
+	condType := v1alpha1.ClusterObservabilityConditionExporterTLSReady
+	if existing := findCondition(conditions, condType); existing != nil {
+		if existing.Status != status {
+			existing.Status = status
+			existing.LastTransitionTime = now
+		}
+		existing.Reason = reason
+		existing.Message = message
+		return conditions
+	}
+	return append(conditions, v1alpha1.ClusterObservabilityCondition{
+		Type:               condType,
+		Status:             status,
+		LastTransitionTime: now,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+// removeExporterTLSReadyCondition removes the ExporterTLSReady condition.
+func removeExporterTLSReadyCondition(conditions []v1alpha1.ClusterObservabilityCondition) []v1alpha1.ClusterObservabilityCondition {
+	condType := v1alpha1.ClusterObservabilityConditionExporterTLSReady
+	filtered := conditions[:0]
+	for _, condition := range conditions {
+		if condition.Type != condType {
+			filtered = append(filtered, condition)
+		}
+	}
+	return filtered
 }

@@ -37,13 +37,16 @@ const (
 )
 
 // Build creates the manifest for the ClusterObservability resource.
-func Build(params manifests.Params) ([]client.Object, error) {
+// exporterTLS holds the validated Secret/ConfigMap material the OTLP HTTP
+// exporter references; it is nil when the exporter references no such
+// material or when the references could not be resolved.
+func Build(params manifests.Params, exporterTLS *ResolvedExporterTLS) ([]client.Object, error) {
 	distro := config.NewConfigLoader().DetectDistroProvider(params.Config)
 
 	var resourceManifests []client.Object
 
 	// Build agent-level collector (DaemonSet)
-	agentCollector, err := buildAgentCollector(params, distro)
+	agentCollector, err := buildAgentCollector(params, distro, exporterTLS)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build agent collector: %w", err)
 	}
@@ -52,7 +55,7 @@ func Build(params manifests.Params) ([]client.Object, error) {
 	}
 
 	// Build cluster-level collector (StatefulSet)
-	clusterCollector, err := buildClusterCollector(params)
+	clusterCollector, err := buildClusterCollector(params, exporterTLS)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build cluster collector: %w", err)
 	}
@@ -76,7 +79,7 @@ func Build(params manifests.Params) ([]client.Object, error) {
 }
 
 // buildAgentCollector creates an OpenTelemetryCollector CR for agent-level collection.
-func buildAgentCollector(params manifests.Params, distro config.DistroProvider) (*v1beta1.OpenTelemetryCollector, error) {
+func buildAgentCollector(params manifests.Params, distro config.DistroProvider, exporterTLS *ResolvedExporterTLS) (*v1beta1.OpenTelemetryCollector, error) {
 	co := params.ClusterObservability
 
 	// Load configuration using the config loader
@@ -87,6 +90,7 @@ func buildAgentCollector(params manifests.Params, distro config.DistroProvider) 
 		config.AgentCollectorType,
 		distro,
 		co.Spec,
+		exporterTLSFiles(exporterTLS),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load agent collector config: %w", err)
@@ -101,6 +105,13 @@ func buildAgentCollector(params manifests.Params, distro config.DistroProvider) 
 	labels := manifestutils.Labels(co.ObjectMeta, agentCollectorName, params.Config.ClusterObservabilityCollectorImage, ComponentClusterObservability, params.Config.LabelsFilter)
 	labels["app.kubernetes.io/managed-by"] = "opentelemetry-operator"
 	labels["app.kubernetes.io/component"] = ComponentClusterObservability
+
+	volumes := agentVolumes(distro)
+	volumeMounts := agentVolumeMounts(distro)
+	if exporterTLS != nil {
+		volumes = append(volumes, exporterTLS.Volumes...)
+		volumeMounts = append(volumeMounts, exporterTLS.VolumeMounts...)
+	}
 
 	agentCollector := &v1beta1.OpenTelemetryCollector{
 		ObjectMeta: metav1.ObjectMeta{
@@ -127,8 +138,8 @@ func buildAgentCollector(params manifests.Params, distro config.DistroProvider) 
 				SecurityContext:    agentSecurityContext(distro),
 				PodSecurityContext: agentPodSecurityContext(distro),
 				HostNetwork:        true,
-				VolumeMounts:       agentVolumeMounts(distro),
-				Volumes:            agentVolumes(distro),
+				VolumeMounts:       volumeMounts,
+				Volumes:            volumes,
 			},
 		},
 	}
@@ -137,7 +148,7 @@ func buildAgentCollector(params manifests.Params, distro config.DistroProvider) 
 }
 
 // buildClusterCollector creates an OpenTelemetryCollector CR for cluster-level collection.
-func buildClusterCollector(params manifests.Params) (*v1beta1.OpenTelemetryCollector, error) {
+func buildClusterCollector(params manifests.Params, exporterTLS *ResolvedExporterTLS) (*v1beta1.OpenTelemetryCollector, error) {
 	co := params.ClusterObservability
 
 	// Load configuration using the config loader
@@ -151,6 +162,7 @@ func buildClusterCollector(params manifests.Params) (*v1beta1.OpenTelemetryColle
 		config.ClusterCollectorType,
 		distroProvider,
 		co.Spec,
+		exporterTLSFiles(exporterTLS),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load cluster collector config: %w", err)
@@ -167,6 +179,31 @@ func buildClusterCollector(params manifests.Params) (*v1beta1.OpenTelemetryColle
 	clusterLabels["app.kubernetes.io/managed-by"] = "opentelemetry-operator"
 	clusterLabels["app.kubernetes.io/component"] = ComponentClusterObservability
 	clusterLabels[constants.LabelTargetAllocator] = naming.TargetAllocator(co.Name)
+
+	commonFields := v1beta1.OpenTelemetryCommonFields{
+		Image:    params.Config.ClusterObservabilityCollectorImage,
+		Replicas: &replicas,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: new(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			RunAsNonRoot: new(true),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+		PodSecurityContext: &corev1.PodSecurityContext{
+			RunAsNonRoot: new(true),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+	}
+	if exporterTLS != nil {
+		commonFields.Volumes = exporterTLS.Volumes
+		commonFields.VolumeMounts = exporterTLS.VolumeMounts
+	}
 
 	clusterCollector := &v1beta1.OpenTelemetryCollector{
 		ObjectMeta: metav1.ObjectMeta{
@@ -185,32 +222,22 @@ func buildClusterCollector(params manifests.Params) (*v1beta1.OpenTelemetryColle
 			},
 		},
 		Spec: v1beta1.OpenTelemetryCollectorSpec{
-			Mode:   v1beta1.ModeStatefulSet,
-			Config: collectorConfig,
-			OpenTelemetryCommonFields: v1beta1.OpenTelemetryCommonFields{
-				Image:    params.Config.ClusterObservabilityCollectorImage,
-				Replicas: &replicas,
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: new(false),
-					Capabilities: &corev1.Capabilities{
-						Drop: []corev1.Capability{"ALL"},
-					},
-					RunAsNonRoot: new(true),
-					SeccompProfile: &corev1.SeccompProfile{
-						Type: corev1.SeccompProfileTypeRuntimeDefault,
-					},
-				},
-				PodSecurityContext: &corev1.PodSecurityContext{
-					RunAsNonRoot: new(true),
-					SeccompProfile: &corev1.SeccompProfile{
-						Type: corev1.SeccompProfileTypeRuntimeDefault,
-					},
-				},
-			},
+			Mode:                    v1beta1.ModeStatefulSet,
+			Config:                  collectorConfig,
+			OpenTelemetryCommonFields: commonFields,
 		},
 	}
 
 	return clusterCollector, nil
+}
+
+// exporterTLSFiles returns the mounted exporter TLS file paths, or nil when no
+// TLS material was resolved.
+func exporterTLSFiles(exporterTLS *ResolvedExporterTLS) *config.ExporterTLSFiles {
+	if exporterTLS == nil {
+		return nil
+	}
+	return &exporterTLS.Files
 }
 
 // buildInstrumentations creates a single Instrumentation CR in the operator namespace
