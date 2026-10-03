@@ -28,6 +28,7 @@ import (
 	testingclock "k8s.io/utils/clock/testing"
 	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1"
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1beta1"
@@ -266,6 +267,16 @@ func (*mockOpampClient) SetConnectionSettingsStatus(*protobufs.ConnectionSetting
 }
 
 func getFakeApplier(t *testing.T, conf *config.Config, lists ...runtimeClient.ObjectList) *operator.Client {
+	c := fake.NewClientBuilder().WithLists(lists...).WithScheme(agentTestScheme(t))
+	return operator.NewClient("test-bridge", l, c.Build(), conf.GetComponentsAllowed())
+}
+
+func getInterceptingApplier(t *testing.T, conf *config.Config, funcs interceptor.Funcs) *operator.Client {
+	c := fake.NewClientBuilder().WithScheme(agentTestScheme(t)).WithInterceptorFuncs(funcs).Build()
+	return operator.NewClient("test-bridge", l, c, conf.GetComponentsAllowed())
+}
+
+func agentTestScheme(t *testing.T) *runtime.Scheme {
 	schemeBuilder := runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(v1alpha1.GroupVersion, &v1alpha1.OpenTelemetryCollector{}, &v1alpha1.OpenTelemetryCollectorList{})
 		s.AddKnownTypes(v1beta1.GroupVersion, &v1beta1.OpenTelemetryCollector{}, &v1beta1.OpenTelemetryCollectorList{})
@@ -274,10 +285,8 @@ func getFakeApplier(t *testing.T, conf *config.Config, lists ...runtimeClient.Ob
 		return nil
 	})
 	scheme := runtime.NewScheme()
-	err := schemeBuilder.AddToScheme(scheme)
-	require.NoError(t, err, "Should be able to add custom types")
-	c := fake.NewClientBuilder().WithLists(lists...).WithScheme(scheme)
-	return operator.NewClient("test-bridge", l, c.Build(), conf.GetComponentsAllowed())
+	require.NoError(t, schemeBuilder.AddToScheme(scheme), "Should be able to add custom types")
+	return scheme
 }
 
 type mockHealthApplier struct {
@@ -285,11 +294,7 @@ type mockHealthApplier struct {
 	err    error
 }
 
-func (*mockHealthApplier) Apply(string, *protobufs.AgentConfigObject) error {
-	return nil
-}
-
-func (*mockHealthApplier) Delete(string) error {
+func (*mockHealthApplier) ApplyConfig(map[string]*protobufs.AgentConfigObject, []string) error {
 	return nil
 }
 
@@ -306,21 +311,22 @@ func (m *mockHealthApplier) GetHealth() (operator.Health, error) {
 }
 
 type recordingConfigApplier struct {
-	applied       map[string][]byte
+	applied       map[string]*protobufs.AgentConfigObject
+	deletedKeys   []string
+	applyErr      error
 	restartCalled int
 	restartErr    error
 }
 
-func (r *recordingConfigApplier) Apply(name string, configFile *protobufs.AgentConfigObject) error {
+func (r *recordingConfigApplier) ApplyConfig(entries map[string]*protobufs.AgentConfigObject, deletedKeys []string) error {
 	if r.applied == nil {
-		r.applied = map[string][]byte{}
+		r.applied = map[string]*protobufs.AgentConfigObject{}
 	}
-	r.applied[name] = configFile.Body
-	return nil
-}
-
-func (*recordingConfigApplier) Delete(string) error {
-	return nil
+	for name, configFile := range entries {
+		r.applied[name] = configFile
+	}
+	r.deletedKeys = append(r.deletedKeys, deletedKeys...)
+	return r.applyErr
 }
 
 func (r *recordingConfigApplier) Restart(context.Context) error {
@@ -386,6 +392,113 @@ func TestAgentApplyRemoteConfigRejectsEmptyBody(t *testing.T) {
 	require.Equal(t, protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, status.Status)
 	assert.Contains(t, status.ErrorMessage, `remote config entry "collector" has empty body`)
 	assert.Empty(t, applier.applied)
+}
+
+// TestAgentApplyRemoteConfigInvalidSnapshotDoesNotCommit verifies the committed key set and
+// the applier stay untouched when one entry of a multi-entry snapshot is invalid, and that
+// a later valid snapshot still converges against the previous committed snapshot.
+func TestAgentApplyRemoteConfigInvalidSnapshotDoesNotCommit(t *testing.T) {
+	applier := &recordingConfigApplier{}
+	agent := NewAgent(logr.Discard(), applier, config.NewConfig(logr.Discard()), &mockOpampClient{}, newMockProxy(nil, nil, nil))
+	agent.appliedKeys = map[string]bool{"old": true}
+	body := []byte("receivers: {}\n")
+	remoteConfig := func(hash string) *protobufs.AgentRemoteConfig {
+		return &protobufs.AgentRemoteConfig{
+			Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
+				"a": {Body: body},
+			}},
+			ConfigHash: []byte(hash),
+		}
+	}
+
+	status, err := agent.applyRemoteConfig(&protobufs.AgentRemoteConfig{
+		Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
+			"a": {Body: body},
+			"":  {Body: body},
+		}},
+		ConfigHash: []byte("bad-snapshot"),
+	})
+	require.Error(t, err)
+	require.Equal(t, protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, status.Status)
+	require.Equal(t, []byte("bad-snapshot"), status.LastRemoteConfigHash)
+	assert.Empty(t, applier.applied, "an invalid snapshot must not reach the applier")
+	assert.Equal(t, map[string]bool{"old": true}, agent.appliedKeys, "the committed key set must survive a failed snapshot")
+
+	status, err = agent.applyRemoteConfig(remoteConfig("good-snapshot"))
+	require.NoError(t, err)
+	require.Equal(t, protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED, status.Status)
+	assert.Contains(t, applier.applied, "a")
+	assert.Equal(t, []string{"old"}, applier.deletedKeys, "the next snapshot must still delete keys from the previous committed snapshot")
+	assert.Equal(t, map[string]bool{"a": true}, agent.appliedKeys)
+}
+
+// TestAgentApplyRemoteConfigWriteFailureRollsBackAndConverges applies a two-entry snapshot
+// through the real operator applier with one failing Kubernetes write. Nothing committed
+// may remain observable, and a later attempt with the same desired snapshot applies fully.
+func TestAgentApplyRemoteConfigWriteFailureRollsBackAndConverges(t *testing.T) {
+	conf := config.NewConfig(logr.Discard())
+	var otherCreateFailed bool
+	applier := getInterceptingApplier(t, conf, interceptor.Funcs{
+		Create: func(ctx context.Context, c runtimeClient.WithWatch, obj runtimeClient.Object, opts ...runtimeClient.CreateOption) error {
+			if obj.GetName() == otherCollectorName && !otherCreateFailed {
+				otherCreateFailed = true
+				return errors.New("simulated api failure")
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	mockClient := &mockOpampClient{}
+	agent := NewAgent(logr.Discard(), applier, conf, mockClient, newMockProxy(nil, nil, nil))
+
+	basicBody, err := os.ReadFile(collectorBasicFile)
+	require.NoError(t, err)
+	updatedBody, err := os.ReadFile(collectorUpdatedFile)
+	require.NoError(t, err)
+	entries := map[string]*protobufs.AgentConfigObject{
+		testCollectorKey:  {Body: basicBody, ContentType: "yaml"},
+		otherCollectorKey: {Body: updatedBody, ContentType: "yaml"},
+	}
+	remoteConfig := &protobufs.AgentRemoteConfig{
+		Config:     &protobufs.AgentConfigMap{ConfigMap: entries},
+		ConfigHash: []byte(basicYamlConfigHash + otherUpdatedYamlConfigHash),
+	}
+
+	status, err := agent.applyRemoteConfig(remoteConfig)
+	require.Error(t, err)
+	require.Equal(t, protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED, status.Status)
+	require.Equal(t, remoteConfig.ConfigHash, status.LastRemoteConfigHash, "FAILED must report the hash that was received")
+	assert.Contains(t, status.ErrorMessage, "simulated api failure")
+
+	testInstance, err := applier.GetInstance(testCollectorName, testNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, testInstance, "the collector created before the failed write must be rolled back")
+	otherInstance, err := applier.GetInstance(otherCollectorName, testNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, otherInstance)
+	assert.Empty(t, agent.appliedKeys)
+
+	effectiveConfig, err := agent.getEffectiveConfig(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, effectiveConfig.GetConfigMap().GetConfigMap(), "effective config must stay at the previous committed snapshot")
+
+	// A later available snapshot with the same desired content converges fully.
+	status, err = agent.applyRemoteConfig(remoteConfig)
+	require.NoError(t, err)
+	require.Equal(t, protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED, status.Status)
+	require.Equal(t, remoteConfig.ConfigHash, status.LastRemoteConfigHash)
+
+	testInstance, err = applier.GetInstance(testCollectorName, testNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, testInstance)
+	otherInstance, err = applier.GetInstance(otherCollectorName, testNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, otherInstance)
+	assert.Len(t, agent.appliedKeys, 2)
+
+	effectiveConfig, err = agent.getEffectiveConfig(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, effectiveConfig.GetConfigMap().GetConfigMap(), testCollectorKey)
+	assert.Contains(t, effectiveConfig.GetConfigMap().GetConfigMap(), otherCollectorKey)
 }
 
 func TestAgent_getHealthFromApplierHealth(t *testing.T) {

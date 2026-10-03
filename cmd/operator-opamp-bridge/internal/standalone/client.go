@@ -39,6 +39,13 @@ type Client struct {
 	watchNamespaces []string
 	healthMux       sync.RWMutex
 	healthUpdaters  map[workloadKey]func() error
+
+	// notifyMu guards notifyTxn and notifyPending. While notifyTxn is greater than zero a
+	// remote config snapshot is writing ConfigMaps, so informer-driven effective config
+	// updates are suppressed and coalesced into one update after the writes settle.
+	notifyMu      sync.Mutex
+	notifyTxn     int
+	notifyPending bool
 }
 
 type workloadKey struct {
@@ -138,9 +145,38 @@ func (c *Client) addWorkloadEventHandler(ctx context.Context, ca cache.Cache, wo
 	return nil
 }
 
+// runTransaction suppresses informer-driven effective config updates while fn applies a
+// remote config snapshot and replays one coalesced update after fn returns, so observers
+// never receive an in-progress mix of the previous and desired snapshots.
+func (c *Client) runTransaction(fn func() error) error {
+	c.notifyMu.Lock()
+	c.notifyTxn++
+	c.notifyMu.Unlock()
+
+	err := fn()
+
+	c.notifyMu.Lock()
+	c.notifyTxn--
+	pending := c.notifyPending
+	c.notifyPending = false
+	c.notifyMu.Unlock()
+	if pending {
+		c.notifyUpdate()
+	}
+	return err
+}
+
 func (c *Client) notifyUpdate() {
-	if c.onUpdate != nil {
-		c.onUpdate()
+	c.notifyMu.Lock()
+	if c.notifyTxn > 0 {
+		c.notifyPending = true
+		c.notifyMu.Unlock()
+		return
+	}
+	onUpdate := c.onUpdate
+	c.notifyMu.Unlock()
+	if onUpdate != nil {
+		onUpdate()
 	}
 }
 
@@ -298,38 +334,23 @@ func (c *Client) getConfigMapFile(namespace string, entry config.StandaloneConfi
 	return []byte(body), nil
 }
 
-// applyConfigMapFile is called when an opamp server pushes config for an agent. It validates the config, updates the local
-// k8s configmap and triggers a rolling restart of the relevant workload.
-func (c *Client) applyConfigMapFile(namespace, workloadType, workloadName string, entry config.StandaloneConfigEntry, configFile *protobufs.AgentConfigObject) error {
+// validateConfigMapFile checks that one remote config entry has a body that is valid
+// collector config, without touching Kubernetes.
+func validateConfigMapFile(configFile *protobufs.AgentConfigObject) error {
 	if len(configFile.Body) == 0 {
 		return errors.New("invalid config to apply: config is empty")
 	}
 	if err := validateCollectorConfigEntry(string(configFile.Body)); err != nil {
 		return fmt.Errorf("invalid collector config: %w", err)
 	}
-
-	existing := &v1.ConfigMap{}
-	err := c.k8sClient.Get(context.Background(), client.ObjectKey{Name: entry.Name, Namespace: namespace}, existing)
-	if apierrors.IsNotFound(err) {
-		return fmt.Errorf("standalone mode does not support creating ConfigMap %s/%s", namespace, entry.Name)
-	} else if err != nil {
-		return fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, entry.Name, err)
-	}
-
-	if existing.Data == nil {
-		existing.Data = map[string]string{}
-	}
-	existing.Data[entry.Key] = string(configFile.Body)
-	if updateErr := c.k8sClient.Update(context.Background(), existing); updateErr != nil {
-		return fmt.Errorf("failed to update ConfigMap %s/%s: %w", namespace, entry.Name, updateErr)
-	}
-	c.log.Info("Updated ConfigMap key", "name", entry.Name, "namespace", namespace, "key", entry.Key)
-
-	if err := rollout.TriggerRollout(context.Background(), c.k8sClient, namespace, workloadType, workloadName); err != nil {
-		return fmt.Errorf("failed to trigger rollout for %s/%s: %w", namespace, workloadName, err)
-	}
-	c.log.Info("Triggered workload rollout", "workloadType", workloadType, "name", workloadName, "namespace", namespace)
 	return nil
+}
+
+// configmapFileChange is one validated remote config entry mapped to the ConfigMap key it
+// writes.
+type configmapFileChange struct {
+	entry config.StandaloneConfigEntry
+	file  *protobufs.AgentConfigObject
 }
 
 type workloadReplicaStatus struct {
@@ -395,19 +416,128 @@ var _ operator.ConfigApplier = &scopedApplier{}
 
 // Apply writes the named remote config entry for this standalone agent.
 // name must match one entry from the agent's standalone config map.
+// It is the single-entry form of ApplyConfig.
 func (s *scopedApplier) Apply(name string, configFile *protobufs.AgentConfigObject) error {
-	entry, ok := s.agent.Config[name]
-	if !ok {
-		return fmt.Errorf("standalone agent %q does not manage config %q", s.agent.WorkloadRef.Name, name)
+	return s.ApplyConfig(map[string]*protobufs.AgentConfigObject{name: configFile}, nil)
+}
+
+// ApplyConfig applies the whole remote config snapshot for one standalone agent. Every
+// entry is validated before any ConfigMap is written and the workload rollout is triggered
+// once after all writes succeed; a failed validation, write, or rollout restores every
+// ConfigMap changed during the call. Keys dropped from the received snapshot cannot be
+// deleted because standalone ConfigMaps pre-exist, so their presence fails the snapshot.
+func (s *scopedApplier) ApplyConfig(entries map[string]*protobufs.AgentConfigObject, deletedKeys []string) error {
+	sortedDeletedKeys := slices.Clone(deletedKeys)
+	slices.Sort(sortedDeletedKeys)
+	if len(sortedDeletedKeys) > 0 {
+		return fmt.Errorf("standalone mode does not support deleting ConfigMap %s", sortedDeletedKeys[0])
 	}
-	if entry.Kind != config.StandaloneConfigEntryKindConfigMap {
-		return fmt.Errorf("unsupported standalone config kind %q", entry.Kind)
+
+	entryNames := make([]string, 0, len(entries))
+	for name := range entries {
+		entryNames = append(entryNames, name)
 	}
-	return s.client.applyConfigMapFile(s.agent.Namespace, s.agent.WorkloadRef.Kind, s.agent.WorkloadRef.Name, entry, configFile)
+	slices.Sort(entryNames)
+
+	changes := make([]configmapFileChange, 0, len(entryNames))
+	for _, name := range entryNames {
+		entry, ok := s.agent.Config[name]
+		if !ok {
+			return fmt.Errorf("standalone agent %q does not manage config %q", s.agent.WorkloadRef.Name, name)
+		}
+		if entry.Kind != config.StandaloneConfigEntryKindConfigMap {
+			return fmt.Errorf("unsupported standalone config kind %q", entry.Kind)
+		}
+		if err := validateConfigMapFile(entries[name]); err != nil {
+			return err
+		}
+		changes = append(changes, configmapFileChange{entry: entry, file: entries[name]})
+	}
+
+	return s.client.runTransaction(func() error {
+		return s.applyConfigMapFiles(changes)
+	})
 }
 
 func (*scopedApplier) Delete(name string) error {
 	return fmt.Errorf("standalone mode does not support deleting ConfigMap %s", name)
+}
+
+// applyConfigMapFiles updates every targeted ConfigMap and triggers the workload rollout
+// once after all writes succeed. A failed write or rollout restores every ConfigMap
+// changed during the call. It runs inside a Client transaction so informer-driven
+// effective config updates cannot observe partially written ConfigMaps.
+func (s *scopedApplier) applyConfigMapFiles(changes []configmapFileChange) error {
+	ctx := context.Background()
+	originals := map[client.ObjectKey]*v1.ConfigMap{}
+	targets := map[client.ObjectKey]*v1.ConfigMap{}
+	for i := range changes {
+		change := changes[i]
+		cmKey := client.ObjectKey{Namespace: s.agent.Namespace, Name: change.entry.Name}
+		cm, ok := targets[cmKey]
+		if !ok {
+			existing := &v1.ConfigMap{}
+			err := s.client.k8sClient.Get(ctx, cmKey, existing)
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("standalone mode does not support creating ConfigMap %s/%s", s.agent.Namespace, change.entry.Name)
+			} else if err != nil {
+				return fmt.Errorf("failed to get ConfigMap %s/%s: %w", s.agent.Namespace, change.entry.Name, err)
+			}
+			originals[cmKey] = existing.DeepCopy()
+			cm = existing
+			targets[cmKey] = cm
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[change.entry.Key] = string(change.file.Body)
+	}
+
+	cmKeys := make([]client.ObjectKey, 0, len(targets))
+	for cmKey := range targets {
+		cmKeys = append(cmKeys, cmKey)
+	}
+	slices.SortFunc(cmKeys, func(a, b client.ObjectKey) int {
+		return strings.Compare(a.String(), b.String())
+	})
+
+	updated := make([]*v1.ConfigMap, 0, len(cmKeys))
+	for _, cmKey := range cmKeys {
+		cm := targets[cmKey]
+		if err := s.client.k8sClient.Update(ctx, cm); err != nil {
+			s.restoreConfigMaps(originals, updated)
+			return fmt.Errorf("failed to update ConfigMap %s: %w", cmKey.String(), err)
+		}
+		updated = append(updated, cm)
+	}
+	for i := range changes {
+		change := changes[i]
+		s.client.log.Info("Updated ConfigMap key", "name", change.entry.Name, "namespace", s.agent.Namespace, "key", change.entry.Key)
+	}
+
+	if err := rollout.TriggerRollout(ctx, s.client.k8sClient, s.agent.Namespace, s.agent.WorkloadRef.Kind, s.agent.WorkloadRef.Name); err != nil {
+		s.restoreConfigMaps(originals, updated)
+		return fmt.Errorf("failed to trigger rollout for %s/%s: %w", s.agent.Namespace, s.agent.WorkloadRef.Name, err)
+	}
+	s.client.log.Info("Triggered workload rollout", "workloadType", s.agent.WorkloadRef.Kind, "name", s.agent.WorkloadRef.Name, "namespace", s.agent.Namespace)
+	return nil
+}
+
+// restoreConfigMaps restores ConfigMaps updated during a failed snapshot to their previous
+// data. ResourceVersion is cleared because the snapshot writes advanced the versions.
+func (s *scopedApplier) restoreConfigMaps(originals map[client.ObjectKey]*v1.ConfigMap, updated []*v1.ConfigMap) {
+	ctx := context.Background()
+	for _, cm := range updated {
+		original, ok := originals[client.ObjectKeyFromObject(cm)]
+		if !ok {
+			continue
+		}
+		restored := original.DeepCopy()
+		restored.ResourceVersion = ""
+		if err := s.client.k8sClient.Update(ctx, restored); err != nil {
+			s.client.log.Error(err, "failed to roll back ConfigMap", "name", original.Name, "namespace", original.Namespace)
+		}
+	}
 }
 
 // Restart triggers a rolling restart of the managed workload by patching the pod template

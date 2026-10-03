@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -16,10 +17,12 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 
 	"github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1"
@@ -35,6 +38,15 @@ const (
 )
 
 func getFakeClient(t *testing.T, lists ...client.ObjectList) client.WithWatch {
+	c := fake.NewClientBuilder().WithLists(lists...).WithScheme(testScheme(t))
+	return c.Build()
+}
+
+func getInterceptorClient(t *testing.T, funcs interceptor.Funcs) client.WithWatch {
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).WithInterceptorFuncs(funcs).Build()
+}
+
+func testScheme(t *testing.T) *runtime.Scheme {
 	schemeBuilder := runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(v1alpha1.GroupVersion, &v1alpha1.OpenTelemetryCollector{}, &v1alpha1.OpenTelemetryCollectorList{})
 		s.AddKnownTypes(v1beta1.GroupVersion, &v1beta1.OpenTelemetryCollector{}, &v1beta1.OpenTelemetryCollectorList{})
@@ -43,10 +55,199 @@ func getFakeClient(t *testing.T, lists ...client.ObjectList) client.WithWatch {
 		return appsv1.AddToScheme(s)
 	})
 	scheme := runtime.NewScheme()
-	err := schemeBuilder.AddToScheme(scheme)
-	require.NoError(t, err, "Should be able to add custom types")
-	c := fake.NewClientBuilder().WithLists(lists...).WithScheme(scheme)
-	return c.Build()
+	require.NoError(t, schemeBuilder.AddToScheme(scheme), "Should be able to add custom types")
+	return scheme
+}
+
+const (
+	applyConfigNamespace = "testing"
+	testCollectorKey2    = applyConfigNamespace + "/test"
+	otherCollectorKey2   = applyConfigNamespace + "/other"
+)
+
+func configEntry(t *testing.T, file string) *protobufs.AgentConfigObject {
+	body, err := loadConfig(file)
+	require.NoError(t, err, "Should be no error on loading test configuration")
+	return &protobufs.AgentConfigObject{Body: body, ContentType: "yaml"}
+}
+
+func TestClient_ApplyConfig_CreatesAllEntries(t *testing.T) {
+	c := NewClient(bridgeName, clientLogger, getFakeClient(t), nil)
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, nil)
+	require.NoError(t, err)
+
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	require.NotNil(t, testInstance)
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	require.NotNil(t, otherInstance)
+}
+
+func TestClient_ApplyConfig_InvalidEntryWritesNothing(t *testing.T) {
+	c := NewClient(bridgeName, clientLogger, getFakeClient(t), nil)
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/invalid-collector.yaml"),
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "error converting YAML to JSON")
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, testInstance, "valid entries must not be applied when another entry is invalid")
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, otherInstance)
+}
+
+func TestClient_ApplyConfig_CreateFailureRollsBack(t *testing.T) {
+	fakeClient := getInterceptorClient(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == "other" {
+				return apierrors.NewInternalError(errors.New("simulated api failure"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	c := NewClient(bridgeName, clientLogger, fakeClient, nil)
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "simulated api failure")
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, testInstance, "collector created before the failed create must be rolled back")
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, otherInstance)
+}
+
+func TestClient_ApplyConfig_UpdateFailureRestoresSnapshot(t *testing.T) {
+	fakeClient := getInterceptorClient(t, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if obj.GetName() == "test" {
+				return apierrors.NewInternalError(errors.New("simulated api failure"))
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	c := NewClient(bridgeName, clientLogger, fakeClient, nil)
+	require.NoError(t, c.Apply(testCollectorKey2, configEntry(t, "testdata/collector.yaml")))
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/updated-collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "simulated api failure")
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	require.NotNil(t, testInstance, "the updated collector must be restored to its previous state")
+	assert.Empty(t, testInstance.Spec.Config.Service.Pipelines["traces"].Processors,
+		"the restored collector must keep the previous snapshot's config")
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, otherInstance, "collector created before the failed update must be rolled back")
+}
+
+func TestClient_ApplyConfig_DeleteFailureRecreatesDeleted(t *testing.T) {
+	fakeClient := getInterceptorClient(t, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == "zzz" {
+				return apierrors.NewInternalError(errors.New("simulated api failure"))
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	c := NewClient(bridgeName, clientLogger, fakeClient, nil)
+	require.NoError(t, c.Apply(testCollectorKey2, configEntry(t, "testdata/collector.yaml")))
+	require.NoError(t, c.Apply(applyConfigNamespace+"/zzz", configEntry(t, "testdata/collector.yaml")))
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, []string{testCollectorKey2, applyConfigNamespace + "/zzz"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "simulated api failure")
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	require.NotNil(t, testInstance, "collector deleted before the failed delete must be recreated")
+	zzzInstance, err := c.GetInstance("zzz", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, zzzInstance)
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, otherInstance, "collector created in the failed snapshot must be rolled back")
+}
+
+func TestClient_ApplyConfig_AppliesUpdatesAndDeletes(t *testing.T) {
+	c := NewClient(bridgeName, clientLogger, getFakeClient(t), nil)
+	require.NoError(t, c.Apply(testCollectorKey2, configEntry(t, "testdata/collector.yaml")))
+
+	err := c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/updated-collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, nil)
+	require.NoError(t, err)
+
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	require.NotNil(t, testInstance)
+	assert.Equal(t, []string{"memory_limiter", "batch"}, testInstance.Spec.Config.Service.Pipelines["traces"].Processors)
+
+	err = c.ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}, []string{testCollectorKey2})
+	require.NoError(t, err)
+
+	deletedInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.Nil(t, deletedInstance)
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, otherInstance)
+}
+
+// TestClient_ApplyConfig_ConvergesAfterFailure verifies that once the failing write
+// succeeds, a new snapshot with the same content applies fully and leaves no trace of the
+// failed attempt.
+func TestClient_ApplyConfig_ConvergesAfterFailure(t *testing.T) {
+	var otherCreateFailed bool
+	fakeClient := getInterceptorClient(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == "other" && !otherCreateFailed {
+				otherCreateFailed = true
+				return apierrors.NewInternalError(errors.New("simulated api failure"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	c := NewClient(bridgeName, clientLogger, fakeClient, nil)
+	entries := map[string]*protobufs.AgentConfigObject{
+		testCollectorKey2:  configEntry(t, "testdata/collector.yaml"),
+		otherCollectorKey2: configEntry(t, "testdata/collector.yaml"),
+	}
+
+	require.Error(t, c.ApplyConfig(entries, nil))
+	require.NoError(t, c.ApplyConfig(entries, nil))
+
+	testInstance, err := c.GetInstance("test", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, testInstance)
+	otherInstance, err := c.GetInstance("other", applyConfigNamespace)
+	require.NoError(t, err)
+	assert.NotNil(t, otherInstance)
 }
 
 func TestClient_Apply(t *testing.T) {

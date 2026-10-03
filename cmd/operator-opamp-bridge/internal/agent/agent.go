@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -421,45 +422,65 @@ func (agent *Agent) rebuildAppliedKeys() error {
 //
 //	map[resource key] -> AgentConfigObject body
 //
-// For every key in the received remote configuration, the agent attempts to apply it via the configured
-// applier. If an entry fails to apply, the agent continues to the next entry. The agent stores the
-// received configuration hash regardless of application status, as per the OpAMP spec.
+// The whole message is one snapshot: every entry must be valid and every add, update, and
+// delete must succeed before the tracked key set is committed and APPLIED is reported. On
+// any failure the applier restores the resources at the previously committed snapshot, the
+// tracked key set is left untouched, and FAILED is reported with the received hash, so a
+// later valid snapshot can still converge. The received hash is stored either way as per
+// the OpAMP spec.
 //
 // INVARIANT: The caller must verify that config isn't nil _and_ the configuration has changed between calls.
 func (agent *Agent) applyRemoteConfig(config *protobufs.AgentRemoteConfig) (*protobufs.RemoteConfigStatus, error) {
-	var errs []error
-	// Apply changes from the received config map
-	for key, file := range config.Config.GetConfigMap() {
+	received := config.Config.GetConfigMap()
+
+	// Validate every entry before the applier touches Kubernetes, so an invalid snapshot
+	// cannot leave any partially written resources behind.
+	entryKeys := make([]string, 0, len(received))
+	for key := range received {
+		entryKeys = append(entryKeys, key)
+	}
+	slices.Sort(entryKeys)
+	var validationErrs []error
+	for _, key := range entryKeys {
 		if key == "" {
-			errs = append(errs, errors.New("remote config entry has empty name"))
+			validationErrs = append(validationErrs, errors.New("remote config entry has empty name"))
 			continue
 		}
-		if len(file.Body) == 0 {
-			errs = append(errs, fmt.Errorf("remote config entry %q has empty body", key))
-			continue
-		}
-		if err := agent.applier.Apply(key, file); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		agent.appliedKeys[key] = true
-	}
-	// Check if anything was deleted
-	for key := range agent.appliedKeys {
-		if _, ok := config.Config.GetConfigMap()[key]; !ok {
-			if err := agent.applier.Delete(key); err != nil {
-				errs = append(errs, err)
-			}
+		if len(received[key].GetBody()) == 0 {
+			validationErrs = append(validationErrs, fmt.Errorf("remote config entry %q has empty body", key))
 		}
 	}
-	agent.lastHash = config.GetConfigHash()
-	multiErr := errors.Join(errs...)
-	if multiErr != nil {
+	if err := errors.Join(validationErrs...); err != nil {
+		agent.lastHash = config.GetConfigHash()
 		return &protobufs.RemoteConfigStatus{
 			LastRemoteConfigHash: agent.lastHash,
 			Status:               protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
-			ErrorMessage:         multiErr.Error(),
-		}, multiErr
+			ErrorMessage:         err.Error(),
+		}, err
+	}
+
+	// The deletion set is computed from the last committed snapshot. A failed apply keeps
+	// appliedKeys unchanged while the applier restores cluster state to the same snapshot.
+	deletedKeys := make([]string, 0)
+	for key := range agent.appliedKeys {
+		if _, ok := received[key]; !ok {
+			deletedKeys = append(deletedKeys, key)
+		}
+	}
+
+	agent.lastHash = config.GetConfigHash()
+	if err := agent.applier.ApplyConfig(received, deletedKeys); err != nil {
+		return &protobufs.RemoteConfigStatus{
+			LastRemoteConfigHash: agent.lastHash,
+			Status:               protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
+			ErrorMessage:         err.Error(),
+		}, err
+	}
+
+	// Commit the snapshot: the tracked set is exactly the keys the server now holds.
+	agent.appliedKeys = make(map[string]bool, len(received))
+	for key := range received {
+		agent.appliedKeys[key] = true
 	}
 	return &protobufs.RemoteConfigStatus{
 		LastRemoteConfigHash: agent.lastHash,
@@ -521,6 +542,9 @@ func (agent *Agent) onMessage(ctx context.Context, msg *types.MessageData) {
 			agent.logger.Error(err, "failed to set remote config status")
 			return
 		}
+		// On failure ApplyConfig restored the previously committed snapshot, so the
+		// effective config reported here is still that snapshot; a new effective config is
+		// only published when the received snapshot applied in full.
 		err = agent.opampClient.UpdateEffectiveConfig(ctx)
 		if err != nil {
 			agent.logger.Error(err, "failed to update effective config")

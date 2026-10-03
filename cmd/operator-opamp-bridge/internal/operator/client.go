@@ -7,6 +7,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,15 +34,12 @@ const (
 )
 
 type ConfigApplier interface {
-	// Apply receives an OpAMP remote config entry name and applies the corresponding configuration.
-	// Implementations define the accepted key format, but keys should match entries returned by
-	// CollectorInstance.GetConfigMap.
-	Apply(key string, configmap *protobufs.AgentConfigObject) error
-
-	// Delete attempts to delete the resource identified by an OpAMP remote config entry name.
-	// Implementations define the accepted key format, but keys should match entries returned by
-	// CollectorInstance.GetConfigMap.
-	Delete(key string) error
+	// ApplyConfig applies one complete remote configuration snapshot. entries contains
+	// every config object in the OpAMP AgentConfigMap; deletedKeys lists keys of the
+	// previously applied snapshot that are absent from entries. All entries are validated
+	// before any Kubernetes write, and a failed write rolls back every write made during
+	// the call, so managed resources stay at the previously applied snapshot.
+	ApplyConfig(entries map[string]*protobufs.AgentConfigObject, deletedKeys []string) error
 
 	// Restart triggers a rolling restart of the managed collector workload(s) in response to
 	// an OpAMP ServerToAgentCommand with type CommandType_Restart.
@@ -74,49 +72,179 @@ func NewClient(name string, log logr.Logger, c client.Client, componentsAllowed 
 	}
 }
 
-func (c Client) Apply(key string, configmap *protobufs.AgentConfigObject) error {
+// preparedChange is one validated remote config entry together with the collector currently
+// in the cluster, which is nil when no collector with the key exists yet.
+type preparedChange struct {
+	name      string
+	namespace string
+	desired   *v1beta1.OpenTelemetryCollector
+	existing  *v1beta1.OpenTelemetryCollector
+}
+
+func (c Client) prepareChange(key string, configmap *protobufs.AgentConfigObject) (preparedChange, error) {
 	resource, err := kubeResourceFromKey(key)
 	if err != nil {
-		return err
+		return preparedChange{}, err
 	}
 	name, namespace := resource.name, resource.namespace
-	c.log.Info("Received new config", "name", name, "namespace", namespace)
 
 	if len(configmap.Body) == 0 {
-		return errors.NewBadRequest("invalid config to apply: config is empty")
+		return preparedChange{}, errors.NewBadRequest("invalid config to apply: config is empty")
 	}
 
 	var collector v1beta1.OpenTelemetryCollector
 	err = yaml.Unmarshal(configmap.Body, &collector)
 	if err != nil {
-		return errors.NewBadRequest(fmt.Sprintf("failed to unmarshal config into v1beta1 API Version: %v", err))
+		return preparedChange{}, errors.NewBadRequest(fmt.Sprintf("failed to unmarshal config into v1beta1 API Version: %v", err))
 	}
 
 	err = c.validateComponents(&collector.Spec.Config)
 	if err != nil {
-		return err
+		return preparedChange{}, err
 	}
 
-	ctx := context.Background()
-	updatedCollector := collector.DeepCopy()
 	instance, err := c.GetInstance(name, namespace)
 	if err != nil {
-		return err
+		return preparedChange{}, err
 	}
 
 	err = c.validateLabels(instance)
 	if err != nil {
-		return err
+		return preparedChange{}, err
 	}
-	err = c.validateLabels(updatedCollector)
+	err = c.validateLabels(&collector)
+	if err != nil {
+		return preparedChange{}, err
+	}
+
+	return preparedChange{
+		name:      name,
+		namespace: namespace,
+		desired:   &collector,
+		existing:  instance,
+	}, nil
+}
+
+func (c Client) Apply(key string, configmap *protobufs.AgentConfigObject) error {
+	change, err := c.prepareChange(key, configmap)
 	if err != nil {
 		return err
 	}
+	c.log.Info("Received new config", "name", change.name, "namespace", change.namespace)
 
-	if instance == nil {
-		return c.create(ctx, name, namespace, updatedCollector)
+	ctx := context.Background()
+	if change.existing == nil {
+		return c.create(ctx, change.name, change.namespace, change.desired)
 	}
-	return c.update(ctx, instance, updatedCollector)
+	return c.update(ctx, change.existing, change.desired)
+}
+
+// collectorDeletion pairs a key the snapshot removes with the collector that currently
+// carries it, nil when the collector no longer exists and the delete is a no-op.
+type collectorDeletion struct {
+	key      string
+	existing *v1beta1.OpenTelemetryCollector
+}
+
+// ApplyConfig applies the whole remote config snapshot. Every entry is validated and the
+// collectors it would remove are captured before any write; a failed create, update, or
+// delete restores all collectors changed during the call to their previous state.
+func (c Client) ApplyConfig(entries map[string]*protobufs.AgentConfigObject, deletedKeys []string) error {
+	entryKeys := make([]string, 0, len(entries))
+	for key := range entries {
+		entryKeys = append(entryKeys, key)
+	}
+	slices.Sort(entryKeys)
+
+	changes := make([]preparedChange, 0, len(entryKeys))
+	for _, key := range entryKeys {
+		change, err := c.prepareChange(key, entries[key])
+		if err != nil {
+			return err
+		}
+		changes = append(changes, change)
+	}
+
+	sortedDeletedKeys := slices.Clone(deletedKeys)
+	slices.Sort(sortedDeletedKeys)
+	deletions := make([]collectorDeletion, 0, len(sortedDeletedKeys))
+	for _, key := range sortedDeletedKeys {
+		resource, err := kubeResourceFromKey(key)
+		if err != nil {
+			return err
+		}
+		existing, err := c.GetInstance(resource.name, resource.namespace)
+		if err != nil {
+			return err
+		}
+		deletions = append(deletions, collectorDeletion{key: key, existing: existing})
+	}
+
+	// All entries are validated and prior state captured. Any failure from here on undoes
+	// the writes already made in this snapshot, in reverse order.
+	var rollbacks []func() error
+	rollbackAll := func(applyErr error) error {
+		for i := len(rollbacks) - 1; i >= 0; i-- {
+			if err := rollbacks[i](); err != nil {
+				c.log.Error(err, "failed to roll back remote config snapshot")
+			}
+		}
+		return applyErr
+	}
+
+	ctx := context.Background()
+	for i := range changes {
+		change := changes[i]
+		if change.existing == nil {
+			if err := c.create(ctx, change.name, change.namespace, change.desired); err != nil {
+				return rollbackAll(err)
+			}
+			key := NewKubeResourceKey(change.namespace, change.name).String()
+			rollbacks = append(rollbacks, func() error { return c.Delete(key) })
+			continue
+		}
+		original := change.existing.DeepCopy()
+		if err := c.update(ctx, change.existing, change.desired); err != nil {
+			return rollbackAll(err)
+		}
+		rollbacks = append(rollbacks, func() error { return c.restoreCollector(original) })
+	}
+	for i := range deletions {
+		deletion := deletions[i]
+		if deletion.existing == nil {
+			continue
+		}
+		original := deletion.existing.DeepCopy()
+		if err := c.Delete(deletion.key); err != nil {
+			return rollbackAll(err)
+		}
+		rollbacks = append(rollbacks, func() error { return c.recreateCollector(original) })
+	}
+	return nil
+}
+
+// restoreCollector overwrites a collector updated during a failed snapshot with its
+// previous state. ResourceVersion is cleared because the snapshot write advanced it.
+func (c Client) restoreCollector(original *v1beta1.OpenTelemetryCollector) error {
+	restored := original.DeepCopy()
+	restored.ResourceVersion = ""
+	if err := c.k8sClient.Update(context.Background(), restored); err != nil {
+		return fmt.Errorf("failed to restore collector %s during rollback: %w", NewKubeResourceKey(restored.Namespace, restored.Name).String(), err)
+	}
+	return nil
+}
+
+// recreateCollector creates a collector deleted during a failed snapshot. Server-assigned
+// fields and status are cleared so Create accepts the object.
+func (c Client) recreateCollector(original *v1beta1.OpenTelemetryCollector) error {
+	restored := original.DeepCopy()
+	restored.ResourceVersion = ""
+	restored.UID = ""
+	restored.Status = v1beta1.OpenTelemetryCollectorStatus{}
+	if err := c.k8sClient.Create(context.Background(), restored); err != nil {
+		return fmt.Errorf("failed to recreate collector %s during rollback: %w", NewKubeResourceKey(restored.Namespace, restored.Name).String(), err)
+	}
+	return nil
 }
 
 func (c Client) validateComponents(collectorConfig *v1beta1.Config) error {

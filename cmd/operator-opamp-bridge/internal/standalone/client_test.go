@@ -5,6 +5,7 @@ package standalone
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -388,7 +389,9 @@ service:
       receivers: [otlp]
       exporters: [debug]
 `
-	err := c.ScopedApplier(testAgentConfig()).Apply("collector", &protobufs.AgentConfigObject{Body: []byte(updatedConfig)})
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(updatedConfig)},
+	}, nil)
 	require.NoError(t, err)
 
 	updated := &v1.ConfigMap{}
@@ -417,7 +420,9 @@ service:
       receivers: [otlp]
       exporters: [debug]
 `
-	err := c.ScopedApplier(testAgentConfig()).Apply("collector", &protobufs.AgentConfigObject{Body: []byte(invalidConfig)})
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(invalidConfig)},
+	}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "collector config failed operator validation")
@@ -437,7 +442,9 @@ service:
       receivers: [otlp]
       exporters: [debug]
 `
-	err := c.ScopedApplier(testAgentConfig()).Apply("collector", &protobufs.AgentConfigObject{Body: []byte(invalidConfig)})
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(invalidConfig)},
+	}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid collector config")
@@ -447,7 +454,9 @@ service:
 func TestScopedApplierApplyRejectsUnknownRemoteName(t *testing.T) {
 	c := newTestClient(getFakeK8sClient(t, testConfigMap()))
 
-	err := c.ScopedApplier(testAgentConfig()).Apply("unknown", &protobufs.AgentConfigObject{Body: []byte(validCollectorConfig)})
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"unknown": {Body: []byte(validCollectorConfig)},
+	}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not manage config")
 }
@@ -455,7 +464,9 @@ func TestScopedApplierApplyRejectsUnknownRemoteName(t *testing.T) {
 func TestScopedApplierApplyDoesNotCreateConfigMap(t *testing.T) {
 	c := newTestClient(getFakeK8sClient(t))
 
-	err := c.ScopedApplier(testAgentConfig()).Apply("collector", &protobufs.AgentConfigObject{Body: []byte(validCollectorConfig)})
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(validCollectorConfig)},
+	}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not support creating ConfigMap")
 }
@@ -463,7 +474,229 @@ func TestScopedApplierApplyDoesNotCreateConfigMap(t *testing.T) {
 func TestScopedApplierDeleteUnsupported(t *testing.T) {
 	c := newTestClient(getFakeK8sClient(t, testConfigMap()))
 
-	err := c.ScopedApplier(testAgentConfig()).Delete("collector")
+	err := c.ScopedApplier(testAgentConfig()).(*scopedApplier).Delete("collector")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not support deleting")
+}
+
+const alternateCollectorConfig = `receivers:
+  otlp:
+    protocols:
+      http:
+exporters:
+  debug:
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+`
+
+func getFakeK8sClientWithInterceptors(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) client.Client {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(funcs)
+	for _, obj := range objs {
+		builder = builder.WithObjects(obj)
+	}
+	return builder.Build()
+}
+
+func twoEntryAgentConfig() config.StandaloneAgentConfig {
+	agentCfg := testAgentConfig()
+	agentCfg.Config["extra"] = config.StandaloneConfigEntry{
+		Kind: config.StandaloneConfigEntryKindConfigMap,
+		Name: "collector-config",
+		Key:  "extra.yaml",
+	}
+	return agentCfg
+}
+
+func TestScopedApplierApplyConfigUpdatesAllEntriesAndRestartsOnce(t *testing.T) {
+	var patchCalls int
+	k8s := getFakeK8sClientWithInterceptors(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, testConfigMap(), testDeployment())
+	c := newTestClient(k8s)
+
+	err := c.ScopedApplier(twoEntryAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(alternateCollectorConfig)},
+		"extra":     {Body: []byte(validCollectorConfig)},
+	}, nil)
+	require.NoError(t, err)
+
+	updated := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, updated))
+	assert.Equal(t, alternateCollectorConfig, updated.Data["collector.yaml"])
+	assert.Equal(t, validCollectorConfig, updated.Data["extra.yaml"])
+
+	updatedDeploy := &appsv1.Deployment{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "standalone-collector", Namespace: "default"}, updatedDeploy))
+	assert.NotEmpty(t, updatedDeploy.Spec.Template.Annotations[rollout.RestartAnnotation])
+	assert.Equal(t, 1, patchCalls, "the workload rollout must be triggered once for the whole snapshot")
+}
+
+func TestScopedApplierApplyConfigInvalidEntryWritesNothing(t *testing.T) {
+	var patchCalls int
+	k8s := getFakeK8sClientWithInterceptors(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, testConfigMap(), testDeployment())
+	c := newTestClient(k8s)
+
+	invalidConfig := `receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:65536
+exporters:
+  debug:
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+`
+	err := c.ScopedApplier(twoEntryAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(alternateCollectorConfig)},
+		"extra":     {Body: []byte(invalidConfig)},
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "collector config failed operator validation")
+	updated := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, updated))
+	assert.Equal(t, validCollectorConfig, updated.Data["collector.yaml"], "valid entries must not be written when another entry is invalid")
+	assert.Equal(t, "extra: true", updated.Data["extra.yaml"])
+	updatedDeploy := &appsv1.Deployment{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "standalone-collector", Namespace: "default"}, updatedDeploy))
+	assert.Empty(t, updatedDeploy.Spec.Template.Annotations[rollout.RestartAnnotation])
+	assert.Equal(t, 0, patchCalls)
+}
+
+func TestScopedApplierApplyConfigWriteFailureRollsBack(t *testing.T) {
+	otherCM := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-config", Namespace: "default"},
+		Data:       map[string]string{"other.yaml": validCollectorConfig},
+	}
+	var patchCalls int
+	k8s := getFakeK8sClientWithInterceptors(t, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if obj.GetName() == "other-config" {
+				return errors.New("simulated api failure")
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, testConfigMap(), otherCM, testDeployment())
+	c := newTestClient(k8s)
+
+	agentCfg := testAgentConfig()
+	agentCfg.Config["other"] = config.StandaloneConfigEntry{
+		Kind: config.StandaloneConfigEntryKindConfigMap,
+		Name: "other-config",
+		Key:  "other.yaml",
+	}
+	err := c.ScopedApplier(agentCfg).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(alternateCollectorConfig)},
+		"other":     {Body: []byte(alternateCollectorConfig)},
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to update ConfigMap default/other-config")
+	collectorCM := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, collectorCM))
+	assert.Equal(t, validCollectorConfig, collectorCM.Data["collector.yaml"],
+		"ConfigMap updated before the failed write must be rolled back to the previous snapshot")
+	restoredOther := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "other-config", Namespace: "default"}, restoredOther))
+	assert.Equal(t, validCollectorConfig, restoredOther.Data["other.yaml"])
+	assert.Equal(t, 0, patchCalls, "the rollout must not be triggered when a ConfigMap write fails")
+}
+
+func TestScopedApplierApplyConfigRolloutFailureRollsBack(t *testing.T) {
+	var rolloutFailed bool
+	var patchCalls int
+	k8s := getFakeK8sClientWithInterceptors(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			if !rolloutFailed {
+				rolloutFailed = true
+				return errors.New("simulated api failure")
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, testConfigMap(), testDeployment())
+	c := newTestClient(k8s)
+	applier := c.ScopedApplier(testAgentConfig())
+	entries := map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(alternateCollectorConfig)},
+	}
+
+	require.Error(t, applier.ApplyConfig(entries, nil), "a failed workload rollout must fail the snapshot")
+	updated := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, updated))
+	assert.Equal(t, validCollectorConfig, updated.Data["collector.yaml"],
+		"ConfigMap writes must be rolled back when the workload rollout fails")
+
+	// A later available snapshot converges once the rollout succeeds.
+	require.NoError(t, applier.ApplyConfig(entries, nil))
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, updated))
+	assert.Equal(t, alternateCollectorConfig, updated.Data["collector.yaml"])
+	assert.Equal(t, 2, patchCalls)
+}
+
+func TestScopedApplierApplyConfigRejectsDeletesWithoutWriting(t *testing.T) {
+	var patchCalls int
+	k8s := getFakeK8sClientWithInterceptors(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}, testConfigMap(), testDeployment())
+	c := newTestClient(k8s)
+
+	err := c.ScopedApplier(testAgentConfig()).ApplyConfig(map[string]*protobufs.AgentConfigObject{
+		"collector": {Body: []byte(alternateCollectorConfig)},
+	}, []string{"dropped"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not support deleting ConfigMap dropped")
+	updated := &v1.ConfigMap{}
+	require.NoError(t, k8s.Get(context.Background(), client.ObjectKey{Name: "collector-config", Namespace: "default"}, updated))
+	assert.Equal(t, validCollectorConfig, updated.Data["collector.yaml"])
+	assert.Equal(t, 0, patchCalls)
+}
+
+func TestClientRunTransactionDefersUpdateNotifications(t *testing.T) {
+	notifications := 0
+	c := NewClient(logr.Discard(), getFakeK8sClient(t), nil, func() {
+		notifications++
+	})
+
+	c.notifyUpdate()
+	assert.Equal(t, 1, notifications)
+
+	require.NoError(t, c.runTransaction(func() error {
+		c.notifyUpdate()
+		c.notifyUpdate()
+		assert.Equal(t, 1, notifications, "informer updates must stay suppressed while a snapshot is applied")
+		return nil
+	}))
+	assert.Equal(t, 2, notifications, "suppressed updates must coalesce into one notification after the transaction")
+
+	require.Error(t, c.runTransaction(func() error {
+		c.notifyUpdate()
+		return errors.New("snapshot failed")
+	}))
+	assert.Equal(t, 3, notifications, "rolled back transactions still publish the settled effective config once")
 }

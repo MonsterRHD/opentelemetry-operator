@@ -78,11 +78,7 @@ func (c *orderCheckingKubernetesClient) Start(context.Context) error {
 
 type healthyApplier struct{}
 
-func (healthyApplier) Apply(string, *protobufs.AgentConfigObject) error {
-	return nil
-}
-
-func (healthyApplier) Delete(string) error {
+func (healthyApplier) ApplyConfig(map[string]*protobufs.AgentConfigObject, []string) error {
 	return nil
 }
 
