@@ -42,6 +42,11 @@ func OpAMPBridgeConfigMapVolume() string {
 	return "opamp-bridge-internal"
 }
 
+// OpAMPBridgeTLSVolume returns the name to use for the TLS Secret's volume in the OpAMPBridge pod.
+func OpAMPBridgeTLSVolume() string {
+	return "opamp-bridge-tls"
+}
+
 // Container returns the name to use for the container in the pod.
 func Container() string {
 	return "otc-container"

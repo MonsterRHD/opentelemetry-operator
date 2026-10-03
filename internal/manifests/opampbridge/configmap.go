@@ -28,7 +28,11 @@ func ConfigMap(params manifests.Params) (*corev1.ConfigMap, error) {
 	}
 
 	if params.OpAMPBridge.Spec.TLS != nil {
-		config["tls"] = params.OpAMPBridge.Spec.TLS
+		tlsConfig, err := renderTLSConfig(*params.OpAMPBridge.Spec.TLS, params.TLSSecret)
+		if err != nil {
+			return &corev1.ConfigMap{}, err
+		}
+		config["tls"] = tlsConfig
 	}
 
 	if len(params.OpAMPBridge.Spec.Headers) > 0 {

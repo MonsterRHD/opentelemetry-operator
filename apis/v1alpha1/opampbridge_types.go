@@ -118,6 +118,15 @@ type OpAMPBridgeStatus struct {
 	// Version of the managed OpAMP Bridge (operand)
 	// +optional
 	Version string `json:"version,omitempty"`
+
+	// ObservedGeneration is the most recent generation observed for this OpAMPBridge. It corresponds to the
+	// OpAMPBridge's generation, which is updated on mutation by the API Server.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Conditions represents the latest available observations of the OpAMPBridge's current state.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 type AgentDescription struct {
@@ -134,6 +143,26 @@ type OpAMPBridgeTLSConfig struct {
 	// InsecureSkipVerify indicates to keep TLS but skip certificate validation.
 	// +optional
 	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
+	// SecretName references a Secret in the same namespace containing the TLS material for the
+	// OpAMP backend connection. The Secret may contain a CA certificate under "ca.crt" and a
+	// client certificate and key under "tls.crt" and "tls.key" for mutual TLS. The Secret is
+	// user-managed and is mounted into the OpAMPBridge pod. When its content changes, the
+	// OpAMPBridge Deployment is restarted so the bridge reconnects with the new certificates.
+	// It cannot be set when Insecure is true.
+	// +optional
+	SecretName string `json:"secretName,omitempty" yaml:"secretName,omitempty"`
+	// CAFile is the path to the CA certificate file used to verify the OpAMP backend. It is not
+	// part of the CRD API: the operator renders it into the OpAMPBridge configuration from the
+	// Secret referenced by SecretName and users must not set it.
+	CAFile string `json:"-" yaml:"ca_file,omitempty"`
+	// CertFile is the path to the client certificate file used for mutual TLS. It is not part of
+	// the CRD API: the operator renders it into the OpAMPBridge configuration from the Secret
+	// referenced by SecretName and users must not set it.
+	CertFile string `json:"-" yaml:"cert_file,omitempty"`
+	// KeyFile is the path to the client private key file used for mutual TLS. It is not part of
+	// the CRD API: the operator renders it into the OpAMPBridge configuration from the Secret
+	// referenced by SecretName and users must not set it.
+	KeyFile string `json:"-" yaml:"key_file,omitempty"`
 }
 
 type OpAMPBridgeProxyConfig struct {
